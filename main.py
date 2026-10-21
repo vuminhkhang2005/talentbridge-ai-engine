@@ -207,10 +207,31 @@ def predict_match(req: CvJdPredictRequest):
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    overall_score = int(round(min(98.0, max(10.0, overall_raw))))
-    skill_score = int(round(min(98.0, max(10.0, skill_raw))))
-    exp_score = int(round(min(98.0, max(10.0, exp_raw))))
-    kw_score = int(round(min(98.0, max(10.0, kw_raw))))
+    # Cross-lingual & structural calibration (handles English CV <-> Vietnamese JD seamlessly)
+    req_cov = float(struct_vec[0, 0])       # [0..1] fraction of required JD skills matched
+    opt_cov = float(struct_vec[0, 1])       # [0..1] fraction of optional JD skills matched
+    skill_rich = float(struct_vec[0, 2])    # [0..1] candidate skill richness
+    exp_ratio = float(struct_vec[0, 3])     # [0..1] experience fulfillment ratio
+
+    struct_skill_score = min(98.0, max(15.0, req_cov * 86.0 + opt_cov * 8.0 + skill_rich * 8.0))
+    struct_exp_score = 92.0 if req.jd_required_years <= req.cv_years else max(35.0, exp_ratio * 88.0)
+    # Cross-lingual semantic alignment bonus when cosine >= 0.45
+    sem_alignment = min(96.0, max(20.0, (max(0.0, cos_sim) / 0.72) * 85.0))
+    struct_kw_score = 0.60 * struct_skill_score + 0.40 * sem_alignment
+
+    # Fuse neural head predictions with structural & cross-lingual signals
+    skill_calibrated = 0.35 * skill_raw + 0.65 * struct_skill_score
+    exp_calibrated = 0.30 * exp_raw + 0.70 * struct_exp_score
+    kw_calibrated = 0.40 * kw_raw + 0.60 * struct_kw_score
+    overall_calibrated = (
+        0.30 * overall_raw
+        + 0.70 * (0.55 * skill_calibrated + 0.25 * exp_calibrated + 0.20 * kw_calibrated)
+    )
+
+    overall_score = int(round(min(98.0, max(12.0, overall_calibrated))))
+    skill_score = int(round(min(98.0, max(12.0, skill_calibrated))))
+    exp_score = int(round(min(98.0, max(12.0, exp_calibrated))))
+    kw_score = int(round(min(98.0, max(12.0, kw_calibrated))))
 
     return CvJdPredictResponse(
         overall_score=overall_score,

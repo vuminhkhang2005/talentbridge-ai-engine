@@ -50,27 +50,30 @@ def extract_struct_features(
 
     req_cov = matched_req / max(1, len(req_set))
     opt_cov = matched_opt / max(1, len(opt_set)) if opt_set else req_cov
-    skill_prec = (matched_req + matched_opt) / max(1, len(cv_set)) if cv_set else req_cov
+    # Reward having rich domain skills instead of penalizing CVs with many skills
+    skill_richness = min(1.0, (matched_req + matched_opt + min(3, len(cv_set)) * 0.25) / max(1, len(req_set)))
 
     if jd_req_years <= 0:
-        exp_ratio = min(1.0, 0.88 + min(0.12, cv_years * 0.04))
+        exp_ratio = 0.95
+        exp_diff_norm = 0.85
     else:
         exp_ratio = min(1.0, cv_years / jd_req_years)
-
-    exp_diff_norm = max(0.0, min(1.0, (cv_years - jd_req_years + 4.0) / 8.0))
+        exp_diff_norm = max(0.0, min(1.0, (cv_years - jd_req_years + 4.0) / 8.0))
 
     cv_tokens = set(re.findall(r"[a-zA-ZÀ-ỹ0-9+#.]{2,}", cv_lower))
     jd_tokens = set(re.findall(r"[a-zA-ZÀ-ỹ0-9+#.]{2,}", jd_text.lower()))
-    lexical_overlap = len(cv_tokens & jd_tokens) / max(1, len(jd_tokens))
+    raw_lex = len(cv_tokens & jd_tokens) / max(1, len(jd_tokens))
+    # Cross-lingual floor: if CV is English and JD is Vietnamese, rely on skill coverage
+    lexical_overlap = max(raw_lex * 1.5, req_cov * 0.85)
 
     return np.array(
         [
             min(1.0, req_cov),
             min(1.0, opt_cov),
-            min(1.0, skill_prec),
+            min(1.0, skill_richness),
             min(1.0, exp_ratio),
             exp_diff_norm,
-            min(1.0, lexical_overlap * 1.5),
+            min(1.0, lexical_overlap),
         ],
         dtype=np.float32,
     )
