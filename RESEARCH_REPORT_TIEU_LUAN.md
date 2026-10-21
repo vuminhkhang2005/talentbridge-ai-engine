@@ -1,45 +1,52 @@
 # BÁO CÁO NGHIÊN CỨU & THỰC NGHIỆM MÔ HÌNH AI (TIỂU LUẬN CHUYÊN NGÀNH)
-**Đề tài:** Nghiên cứu và xây dựng mô hình học sâu song tháp (*Dual-Tower Bi-Encoder & Cross-Interaction Neural Network*) đánh giá mức độ phù hợp ngữ nghĩa giữa Hồ sơ ứng viên (CV) và Bản mô tả công việc (JD) tiếng Việt.
+**Đề tài:** Nghiên cứu và Fine-tune End-to-End mô hình học sâu **Pre-trained Multilingual Transformer Bi-Encoder & Cross-Interaction Neural Network** đánh giá mức độ phù hợp ngữ nghĩa giữa Hồ sơ ứng viên (CV) và Bản mô tả công việc (JD).
 
 ---
 
-## 1. Kiến trúc Mô hình Đề xuất (`TalentBridge-BiEncoder v2.1`)
+## 1. Kiến trúc Mô hình Đề xuất (`TalentBridge-Transformer-BiEncoder v3.0`)
 
-Mô hình được thiết kế và huấn luyện trực tiếp bằng **PyTorch (`torch.nn.Module`)** theo kiến trúc **Siamese Dual-Tower kết hợp Cross-Interaction Fusion**:
+Mô hình được xây dựng và huấn luyện End-to-End trên GPU bằng **PyTorch** và **HuggingFace `transformers`**, sử dụng kiến trúc **Dual-Tower Siamese Transformer kết hợp Cross-Interaction Multi-Task Head**:
 
-1. **Tầng Biểu diễn Đa ngữ cảnh (Hybrid Word + Subword Representation $\mathbb{R}^{96}$):**
-   - Kết hợp Word N-gram ($n \in [1, 3]$) và Character Boundary N-gram ($n \in [3, 5]$) kèm biến đổi LSA/TruncatedSVD để xử lý đồng thời thuật ngữ chuyên ngành tiếng Anh (`Spring Boot`, `React`, `Kubernetes`, `CI/CD`) và ngữ cảnh tiếng Việt trong CV/JD.
-2. **Tháp Mã hóa Kép có Kết nối Tắt (Dual-Tower Residual Encoders):**
-   - Hai mạng nơ-ron độc lập $E_{CV}(\cdot)$ và $E_{JD}(\cdot)$ ánh xạ văn bản CV và JD vào không gian ngữ nghĩa chuẩn hóa $L_2$ chiều $d = 64$:
-     $$u = \frac{E_{CV}(x_{CV})}{\|E_{CV}(x_{CV})\|_2}, \quad v = \frac{E_{JD}(x_{JD})}{\|E_{JD}(x_{JD})\|_2} \in \mathbb{R}^{64}$$
-3. **Tầng Tương tác Chéo & Đặc trưng Cấu trúc (Cross-Interaction & Structural Fusion):**
-   - Vector tương tác tổng hợp kết hợp tích Hadamard, hiệu tuyệt đối không gian ẩn, độ tương đồng Cosine $\cos(u, v)$ và vector 6 đặc trưng cấu trúc $s \in \mathbb{R}^6$ (tỷ lệ khớp kỹ năng lõi, kỹ năng ưu tiên, độ chính xác kỹ năng, chênh lệch số năm kinh nghiệm, độ phủ từ khóa chuyên ngành):
-     $$z = [u \,\|\, v \,\|\, |u - v| \,\|\, (u \odot v) \,\|\, \cos(u, v) \,\|\, s] \in \mathbb{R}^{263}$$
-4. **Hàm Mất mát Đa nhiệm (Multi-Task Learning Objective):**
-   - Tối ưu đồng thời 4 đầu ra (`Overall Match`, `Skill Match`, `Experience Match`, `Keyword Match`) cùng ràng buộc tương đồng Cosine:
-     $$\mathcal{L} = 0.45\,\mathcal{L}_{\text{Huber}}(\hat{y}_{\text{overall}}, y_{\text{overall}}) + 0.25\,\mathcal{L}_{\text{Huber}}(\hat{y}_{\text{skill}}, y_{\text{skill}}) + 0.15\,\mathcal{L}_{\text{Huber}}(\hat{y}_{\text{exp}}, y_{\text{exp}}) + 0.10\,\mathcal{L}_{\text{Huber}}(\hat{y}_{\text{kw}}, y_{\text{kw}}) + 0.05\,\mathcal{L}_{\text{Cosine}}(u, v, y)$$
+1. **Tầng Backbone Pre-trained Multilingual Transformer (`118.4M Parameters`, 12 Attention Layers):**
+   - Sử dụng mô hình [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) gồm 12 khối Multi-Head Self-Attention ($d_{\text{model}} = 384$).
+   - **Chiến lược Mở khóa Tầng Chọn lọc (Selective Layer Unfreezing & Differential Learning Rate):** Mở khóa trực tiếp **6 tầng Transformer Encoder trên cùng (`Layer 6..11`) + Pooler** (`11,104,676` tham số huấn luyện trực tiếp bằng lan truyền ngược qua cơ chế Self-Attention với `lr = 2e-5`), kết hợp với đầu tương tác chéo (`lr = 3e-4`) và Mixed Precision (`FP16`).
+2. **Tháp Chiếu Kép Có Kết Nối Tắt (Dual-Tower Residual Projection):**
+   - Ánh xạ biểu diễn ngữ cảnh Mean-Pooled $e_{CV}, e_{JD} \in \mathbb{R}^{384}$ qua khối `ResidualSemanticBlock` vào không gian ẩn chuẩn hóa $L_2$ chiều $d = 128$:
+     $$u = \frac{P_{CV}(e_{CV})}{\|P_{CV}(e_{CV})\|_2}, \quad v = \frac{P_{JD}(e_{JD})}{\|P_{JD}(e_{JD})\|_2} \in \mathbb{R}^{128}$$
+3. **Tầng Tương tác Chéo & Đặc trưng Cấu trúc ATS (Cross-Interaction Fusion Head):**
+   - Kết hợp $[u \,\|\, v \,\|\, |u - v| \,\|\, (u \odot v) \,\|\, \cos(e_{CV}, e_{JD}) \,\|\, \cos(u, v) \,\|\, s_{\text{ATS}}] \in \mathbb{R}^{520}$ để dự đoán đa nhiệm 4 đầu ra (`Overall Match`, `Skill Match`, `Experience Match`, `Keyword Match`).
 
 ---
 
-## 2. Bộ Dữ liệu Thực nghiệm (`cv_jd_vietnamese_dataset.json`)
+## 2. Bộ Dữ liệu Thực nghiệm Quy mô Lớn (`9,977` cặp CV–JD)
 
-- **Tổng số mẫu cặp `(CV, JD)`:** `360` cặp song ngữ Việt – Anh thuộc **8 lĩnh vực tuyển dụng** (`Backend Java`, `Backend .NET`, `Frontend React/TypeScript`, `AI & Data Engineering`, `Cloud & DevOps`, `Backend Golang`, `QA & Automation Test`, `Business & Digital Marketing`).
-- **Phân chia tập dữ liệu (Stratified Split theo nhãn `FIT` / `PARTIAL` / `NOT_FIT`):**
-  - **Tập Huấn luyện (Train Set - 70%):** `252` cặp
-  - **Tập Kiểm định (Validation Set - 15%):** `54` cặp
-  - **Tập Kiểm thử Độc lập (Test Set - 15%):** `54` cặp
+- **`7,977` cặp `(Resume, JD)` thực tế của con người từ HuggingFace** ([`cnamuangtoun/resume-job-description-fit`](https://huggingface.co/datasets/cnamuangtoun/resume-job-description-fit) — toàn bộ tập `train.csv` và `test.csv`).
+- **`2,000` cặp `(CV, JD)` tiếng Việt & song ngữ** thuộc 8 lĩnh vực CNTT & Kinh doanh (có biến thể từ đồng nghĩa, viết tắt chuyên ngành và mẫu *Hard Negatives*).
+- **Phân chia tập dữ liệu (Stratified Split 70% / 15% / 15%):**
+  - **Train Set:** `6,983` cặp
+  - **Validation Set:** `1,497` cặp
+  - **Test Set Độc lập:** `1,497` cặp
 
 ---
 
-## 3. Kết quả Thực nghiệm So sánh trên Tập Test (`n = 54`)
+## 3. Kết quả Thực nghiệm So sánh 4 Phương pháp trên Tập Test (`n = 1,497`)
 
-| Phương pháp / Mô hình | MAE $\downarrow$ (Điểm 0-100) | RMSE $\downarrow$ (Điểm 0-100) | Pearson $r$ $\uparrow$ | Spearman $\rho$ $\uparrow$ | Accuracy (3 lớp) $\uparrow$ | Macro F1-Score $\uparrow$ | Thời gian suy luận (ms/cặp) |
+| Phương pháp / Mô hình | Tham số (Params) | MAE $\downarrow$ (0-100) | RMSE $\downarrow$ (0-100) | Pearson $r$ $\uparrow$ | Spearman $\rho$ $\uparrow$ | Accuracy (3 lớp) $\uparrow$ | Macro F1-Score $\uparrow$ |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Baseline 1:** Đếm từ khóa (Lexical Keyword Overlap) | `16.88` | `20.28` | `0.8478` | `0.6113` | `53.7%` | `53.44%` | `0.096 ms` |
-| **Baseline 2:** Vector TF-IDF Cosine Similarity | `14.03` | `16.86` | `0.8396` | `0.5747` | `57.41%` | `60.57%` | `4.45 ms` |
-| **Proposed Model:** `TalentBridge-BiEncoder (PyTorch)` | **`4.73`** | **`5.97`** | **`0.9611`** | **`0.9165`** | **`90.74%`** | **`92.42%`** | **`0.061 ms`** |
+| **Baseline 1:** Đếm từ khóa (Lexical Keyword Overlap) | Rule-based | `20.08` | `25.59` | `0.2984` | `0.2166` | `51.97%` | `38.06%` |
+| **Baseline 2:** Vector TF-IDF Cosine Similarity | Unsupervised | `19.36` | `25.55` | `0.3565` | `0.3326` | `53.44%` | `38.31%` |
+| **Baseline 3:** Zero-Shot Pre-trained Transformer (`MiniLM-L12`) | `118.1M` (Frozen) | `19.79` | `22.75` | `0.3374` | `0.3114` | `41.75%` | `39.1%` |
+| **Proposed:** `TalentBridge-Transformer-BiEncoder v3.0 (End-to-End Fine-tuned)` | **`118.4M` (`11,104,676` Trainable)** | **`10.82`** | **`17.34`** | **`0.715`** | **`0.7177`** | **`71.88%`** | **`69.52%`** |
 
-### Nhận xét Khoa học:
-1. **Giảm sai số dự đoán rõ rệt:** Mô hình `TalentBridge-BiEncoder (PyTorch)` giảm sai số tuyệt đối trung bình (**MAE**) từ `16.88` (Baseline 1) và `14.03` (Baseline 2) xuống chỉ còn **`4.73` điểm** trên thang 100.
-2. **Tương quan thứ hạng ứng viên cao:** Hệ số tương quan hạng **Spearman $\rho = 0.9165$** chứng minh mô hình xếp hạng ứng viên sát với đánh giá chuyên gia HR.
-3. **Phân loại mức độ phù hợp chính xác:** Đạt **Macro F1-Score `92.42%`** trên 3 nhóm (`FIT`, `PARTIAL`, `NOT_FIT`), đồng thời tốc độ suy luận đạt **`0.061 ms/cặp`**, đáp ứng tốt thời gian thực khi ứng viên bấm phân tích trên giao diện ứng tuyển.
+---
+
+## 4. Biểu đồ Thực nghiệm (300 DPI)
+
+### Hình 1: Quá trình hội tụ End-to-End Transformer Backpropagation
+![Training Curves](./reports/figures/training_curves.png)
+
+### Hình 2: So sánh Macro F1-Score và Sai số MAE giữa 4 phương pháp
+![Benchmark Comparison](./reports/figures/benchmark_comparison.png)
+
+### Hình 3: Phân bố điểm dự đoán so với nhãn thực tế trên tập Kiểm thử độc lập (`n = 1,497`)
+![Prediction Scatter](./reports/figures/prediction_scatter.png)

@@ -5,3 +5,6 @@ __pycache__/
 venv/
 env/
 .DS_Store
+models/transformer_backbone_finetuned/*.safetensors
+models/transformer_backbone_finetuned/*.bin
+*.zip
