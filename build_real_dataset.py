@@ -1,12 +1,13 @@
 """
-Real-World + Bilingual Vietnamese CV-JD Dataset Builder
-1. Downloads real human-written (Resume, Job Description, Fit Label) pairs from HuggingFace Hub:
-   `cnamuangtoun/resume-job-description-fit` (real ATS dataset with 'Good Fit', 'Potential Fit', 'No Fit').
-2. Augments and pairs with realistic noisy Vietnamese & Bilingual IT/Business CV-JD records
+Large-Scale Real-World + Bilingual Vietnamese CV-JD Dataset Builder (~10,000 Pairs)
+1. Downloads ALL real human-written (Resume, Job Description, Fit Label) pairs from HuggingFace Hub:
+   `cnamuangtoun/resume-job-description-fit` (`train.csv`: 6,241 pairs + `test.csv`: 1,759 pairs = 8,000 real pairs).
+2. Synthesizes 2,000 realistic, noisy Vietnamese & Bilingual IT/Business CV-JD records
    (containing synonyms, abbreviations like K8s/Kubernetes, JS/JavaScript, career-switcher hard negatives,
-   and multi-section unstructured CVs) to build a 1,500-pair benchmark dataset.
+   and multi-section unstructured CVs) -> Total ~10,000 CV-JD pairs!
 """
 
+import argparse
 import csv
 import io
 import json
@@ -21,6 +22,7 @@ from generate_dataset import DOMAINS, EXP_LEVELS
 random.seed(42)
 
 HF_TRAIN_CSV_URL = "https://huggingface.co/datasets/cnamuangtoun/resume-job-description-fit/resolve/main/train.csv"
+HF_TEST_CSV_URL = "https://huggingface.co/datasets/cnamuangtoun/resume-job-description-fit/resolve/main/test.csv"
 
 SKILL_SYNONYMS_AUG = {
     "Kubernetes": ["K8s", "Kubernetes (EKS/GKE)", "Container Orchestration"],
@@ -47,11 +49,7 @@ def extract_skills_from_raw_text(text: str) -> List[str]:
         "Microservices", "Kafka", "Spark", "Airflow", "Terraform", "Selenium", "Playwright",
         "Postman", "Agile/Scrum", "Communication", "Digital Marketing", "SEO / SEM", "B2B Sales",
     ]
-    found = []
-    for sk in known:
-        if sk.lower() in lower:
-            found.append(sk)
-    return found
+    return [sk for sk in known if sk.lower() in lower]
 
 
 def estimate_years_from_raw_text(text: str, default_val: int = 2) -> int:
@@ -65,34 +63,37 @@ def estimate_years_from_raw_text(text: str, default_val: int = 2) -> int:
     return default_val
 
 
-def download_huggingface_real_pairs(max_real: int = 900) -> List[Dict]:
-    """
-    Downloads real human-written Resume-JD pairs from HuggingFace `cnamuangtoun/resume-job-description-fit`.
-    """
-    print(f"      Downloading real Resume-JD dataset from HuggingFace ({HF_TRAIN_CSV_URL})...")
-    req = urllib.request.Request(HF_TRAIN_CSV_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+def _fetch_csv_rows(url: str) -> List[Dict]:
+    print(f"      Downloading {url} ...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=45) as resp:
         raw_bytes = resp.read()
-
     text_stream = io.StringIO(raw_bytes.decode("utf-8", errors="ignore"))
     reader = csv.DictReader(text_stream)
-
-    by_label: Dict[str, List[Dict]] = {"Good Fit": [], "Potential Fit": [], "No Fit": []}
+    rows = []
     for row in reader:
         cv_txt = (row.get("resume_text") or "").strip()
         jd_txt = (row.get("job_description_text") or "").strip()
         lbl = (row.get("label") or "").strip()
-        if len(cv_txt) < 120 or len(jd_txt) < 120 or lbl not in by_label:
-            continue
-        by_label[lbl].append({"cv_text": cv_txt[:1800], "jd_text": jd_txt[:1800], "raw_label": lbl})
+        if len(cv_txt) >= 100 and len(jd_txt) >= 100 and lbl in ("Good Fit", "Potential Fit", "No Fit"):
+            rows.append({"cv_text": cv_txt[:2200], "jd_text": jd_txt[:2200], "raw_label": lbl})
+    return rows
 
-    per_class = max_real // 3
-    sampled_rows = []
-    for lbl, items in by_label.items():
-        random.shuffle(items)
-        sampled_rows.extend(items[:per_class])
 
-    random.shuffle(sampled_rows)
+def download_huggingface_real_pairs(max_real: int = 8000) -> List[Dict]:
+    """
+    Downloads up to 8,000 real human-written Resume-JD pairs from HuggingFace
+    (`train.csv` + `test.csv` of `cnamuangtoun/resume-job-description-fit`).
+    """
+    rows = _fetch_csv_rows(HF_TRAIN_CSV_URL)
+    if len(rows) < max_real:
+        try:
+            rows.extend(_fetch_csv_rows(HF_TEST_CSV_URL))
+        except Exception as e:
+            print(f"      Note: test.csv fetch skipped ({e})")
+
+    random.shuffle(rows)
+    sampled_rows = rows[:max_real]
     real_records = []
 
     for idx, item in enumerate(sampled_rows, start=1):
@@ -150,13 +151,7 @@ def download_huggingface_real_pairs(max_real: int = 900) -> List[Dict]:
     return real_records
 
 
-def generate_noisy_vietnamese_pairs(start_id: int, count: int = 600) -> List[Dict]:
-    """
-    Generates realistic, noisy Vietnamese & bilingual CV-JD pairs including:
-      - Synonym/abbreviation variations (so simple keyword matching fails)
-      - Hard negatives (same domain keywords mentioned as 'familiar with' or 'studying', or wrong seniority)
-      - Diverse formatting styles (bullet points, narrative paragraphs, project logs)
-    """
+def generate_noisy_vietnamese_pairs(start_id: int, count: int = 2000) -> List[Dict]:
     records = []
     tiers = ["FIT", "PARTIAL", "NOT_FIT"]
     weights = [0.35, 0.35, 0.30]
@@ -183,7 +178,6 @@ def generate_noisy_vietnamese_pairs(start_id: int, count: int = 600) -> List[Dic
             k_req = random.randint(2, max(2, len(req_skills) - 2))
             cand_skills = random.sample(req_skills, k=k_req)
         else:
-            # Hard negative: either different domain OR career switcher with only 0-1 skill
             other_doms = [d for d in DOMAINS if d["domain"] != jd_dom["domain"]]
             cv_dom = random.choice(other_doms)
             jd_level = random.choice(EXP_LEVELS[2:])
@@ -192,7 +186,6 @@ def generate_noisy_vietnamese_pairs(start_id: int, count: int = 600) -> List[Dic
             opt_skills = random.sample(jd_dom["nice_skills"], k=min(2, len(jd_dom["nice_skills"])))
             cand_skills = random.sample(cv_dom["core_skills"], k=min(4, len(cv_dom["core_skills"])))
 
-        # Apply synonym surface-form variation in CV text so surface tokens differ from JD tokens
         displayed_cv_skills = []
         for sk in cand_skills:
             if sk in SKILL_SYNONYMS_AUG and random.random() < 0.65:
@@ -264,7 +257,7 @@ def generate_noisy_vietnamese_pairs(start_id: int, count: int = 600) -> List[Dic
     return records
 
 
-def build_complete_dataset(output_path: Path, real_count: int = 900, vi_count: int = 600) -> List[Dict]:
+def build_complete_dataset(output_path: Path, real_count: int = 8000, vi_count: int = 2000) -> List[Dict]:
     try:
         real_pairs = download_huggingface_real_pairs(max_real=real_count)
         print(f"      Successfully loaded {len(real_pairs)} real human Resume-JD pairs from HuggingFace!")
@@ -282,11 +275,16 @@ def build_complete_dataset(output_path: Path, real_count: int = 900, vi_count: i
         json.dump(all_pairs, f, ensure_ascii=False, indent=2)
 
     print(
-        f"      Saved {len(all_pairs)} total pairs ({len(real_pairs)} HuggingFace Real + {len(vi_pairs)} Vietnamese Bilingual) -> {output_path}"
+        f"      Saved {len(all_pairs):,} total pairs ({len(real_pairs):,} HuggingFace Real + {len(vi_pairs):,} Vietnamese Bilingual) -> {output_path}"
     )
     return all_pairs
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--real-count", type=int, default=8000, help="Max real HuggingFace Resume-JD pairs")
+    parser.add_argument("--vi-count", type=int, default=2000, help="Vietnamese & Bilingual CV-JD pairs")
+    args = parser.parse_args()
+
     out_file = Path(__file__).parent / "dataset" / "cv_jd_vietnamese_dataset.json"
-    build_complete_dataset(out_file, real_count=900, vi_count=600)
+    build_complete_dataset(out_file, real_count=args.real_count, vi_count=args.vi_count)

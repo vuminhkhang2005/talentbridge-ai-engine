@@ -1,75 +1,44 @@
 """
-Training & Scientific Benchmark Script for TalentBridge-Transformer-BiEncoder v3.0
-- Dataset: 1,500 pairs (900 Real Human Resume-JD pairs from HuggingFace `cnamuangtoun/resume-job-description-fit`
-           + 600 Noisy Vietnamese Bilingual IT/Business CV-JD pairs).
-- Backbone: HuggingFace Pre-trained Multilingual Transformer
-            (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, 118M parameters, 12 layers, d=384)
-            fused with Hybrid Word+Char Subword SVD (d=128) -> 512-dim Joint Semantic Representation.
-- Benchmarks 4 Methods on Held-out Test Set (n=225):
-    1. Baseline 1: Lexical Keyword Overlap (Jaccard Token Matching)
-    2. Baseline 2: Unsupervised TF-IDF Cosine Similarity
-    3. Baseline 3: Zero-Shot Pre-trained Multilingual Transformer (118M params without task fine-tuning)
-    4. Proposed:   Fine-tuned TalentBridge-Transformer-BiEncoder v3.0 (Dual-Tower + Cross-Interaction Head)
-- Exports 3 publication-quality charts (300 DPI) to `reports/figures/` for the Specialized Project Report.
+End-to-End Fine-Tuning & Scientific Benchmark Script for TalentBridge-Transformer-BiEncoder v3.0
+- Dataset: ~10,000 pairs (8,000 Real Human Resume-JD pairs from HuggingFace `cnamuangtoun/resume-job-description-fit`
+           + 2,000 Noisy Vietnamese Bilingual IT/Business CV-JD pairs).
+           Stratified Split: 70% Train (~7,000) | 15% Val (~1,500) | 15% Test (~1,500).
+- Architecture: `EndToEndTransformerBiEncoder`
+  * Backbone: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (118.4M total parameters, 12 Attention layers).
+  * End-to-End Unfreezing: Unfreezes top 6 Transformer Self-Attention Encoder blocks + Pooler + Dual-Tower Residual
+    Projection + Cross-Interaction Multi-Task Head (~43M trainable parameters).
+  * Optimization: Differential Learning Rates (`2e-5` for Transformer layers, `3e-4` for Dual-Tower Fusion Head),
+    Mixed Precision FP16 (`torch.amp.autocast`), Gradient Clipping (`1.0`), Linear Warmup + Cosine Annealing.
+- Benchmarks 4 Methods on Held-out Test Set (n ~ 1,500) & exports 300-DPI plots to `reports/figures/`.
 """
 
 import json
 import math
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
-import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.stats import pearsonr, spearmanr
-from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import FeatureUnion, Pipeline
-from sklearn.preprocessing import Normalizer
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModel, AutoTokenizer
 
 from build_real_dataset import build_complete_dataset
 from model_arch import extract_struct_features
 from transformer_model import (
-    CvJdBiEncoderHead,
     DEFAULT_TRANSFORMER_BACKBONE,
-    TransformerFeatureExtractor,
+    EndToEndTransformerBiEncoder,
+    mean_pooling,
 )
-
-
-def build_subword_encoder(embedding_dim: int = 128) -> Pipeline:
-    union = FeatureUnion(
-        [
-            (
-                "word_tfidf",
-                TfidfVectorizer(
-                    ngram_range=(1, 3),
-                    max_features=6000,
-                    sublinear_tf=True,
-                    lowercase=True,
-                ),
-            ),
-            (
-                "char_tfidf",
-                TfidfVectorizer(
-                    analyzer="char_wb",
-                    ngram_range=(3, 5),
-                    max_features=6000,
-                    sublinear_tf=True,
-                    lowercase=True,
-                ),
-            ),
-        ]
-    )
-    svd = TruncatedSVD(n_components=embedding_dim, random_state=42)
-    norm = Normalizer(copy=False)
-    return Pipeline([("features", union), ("svd", svd), ("norm", norm)])
 
 
 def score_to_label(score_0_100: float) -> str:
@@ -78,6 +47,74 @@ def score_to_label(score_0_100: float) -> str:
     elif score_0_100 >= 50.0:
         return "PARTIAL"
     return "NOT_FIT"
+
+
+class CvJdPairDataset(Dataset):
+    def __init__(self, items: List[Dict]):
+        self.items = items
+        self.structs = np.stack(
+            [
+                extract_struct_features(
+                    x["cv_text"],
+                    x["jd_text"],
+                    x.get("cv_skills", []),
+                    x.get("jd_required_skills", []),
+                    x.get("jd_optional_skills", []),
+                    float(x.get("cv_years", 1)),
+                    float(x.get("jd_required_years", 1)),
+                )
+                for x in items
+            ]
+        ).astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Dict:
+        x = self.items[idx]
+        return {
+            "cv_text": x["cv_text"],
+            "jd_text": x["jd_text"],
+            "struct": self.structs[idx],
+            "y_overall": float(x["ground_truth_score"]) / 100.0,
+            "y_skill": float(x["skill_score"]) / 100.0,
+            "y_exp": float(x["exp_score"]) / 100.0,
+            "y_kw": float(x["keyword_score"]) / 100.0,
+        }
+
+
+def make_collate_fn(tokenizer, max_length: int = 256):
+    def collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+        cv_texts = [b["cv_text"] for b in batch]
+        jd_texts = [b["jd_text"] for b in batch]
+
+        cv_tok = tokenizer(
+            cv_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        jd_tok = tokenizer(
+            jd_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        return {
+            "cv_input_ids": cv_tok["input_ids"],
+            "cv_attention_mask": cv_tok["attention_mask"],
+            "jd_input_ids": jd_tok["input_ids"],
+            "jd_attention_mask": jd_tok["attention_mask"],
+            "struct": torch.tensor(np.stack([b["struct"] for b in batch]), dtype=torch.float32),
+            "y_overall": torch.tensor([b["y_overall"] for b in batch], dtype=torch.float32),
+            "y_skill": torch.tensor([b["y_skill"] for b in batch], dtype=torch.float32),
+            "y_exp": torch.tensor([b["y_exp"] for b in batch], dtype=torch.float32),
+            "y_kw": torch.tensor([b["y_kw"] for b in batch], dtype=torch.float32),
+        }
+
+    return collate
 
 
 def evaluate_predictions(
@@ -113,7 +150,6 @@ def save_publication_plots(
 ) -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Training Loss & Validation MAE Curve
     epochs = [h["epoch"] for h in history]
     tr_loss = [h["train_loss"] for h in history]
     va_mae = [h["val_mae"] for h in history]
@@ -121,23 +157,22 @@ def save_publication_plots(
     fig, ax1 = plt.subplots(figsize=(8.5, 4.8), dpi=220)
     color1 = "#059669"
     color2 = "#2563eb"
-    ax1.set_xlabel("Epoch", fontweight="bold")
+    ax1.set_xlabel("Epoch (End-to-End Transformer Backpropagation)", fontweight="bold")
     ax1.set_ylabel("Multi-Task Huber Loss (Train)", color=color1, fontweight="bold")
-    ax1.plot(epochs, tr_loss, color=color1, linewidth=2.4, marker="o", label="Train Huber Loss")
+    ax1.plot(epochs, tr_loss, color=color1, linewidth=2.5, marker="o", label="Train Huber Loss")
     ax1.tick_params(axis="y", labelcolor=color1)
     ax1.grid(True, linestyle="--", alpha=0.35)
 
     ax2 = ax1.twinx()
     ax2.set_ylabel("Validation MAE (0-100 scale)", color=color2, fontweight="bold")
-    ax2.plot(epochs, va_mae, color=color2, linewidth=2.4, linestyle="--", marker="s", label="Validation MAE")
+    ax2.plot(epochs, va_mae, color=color2, linewidth=2.5, linestyle="--", marker="s", label="Validation MAE")
     ax2.tick_params(axis="y", labelcolor=color2)
 
-    plt.title("Quá trình Hội tụ Huấn luyện TalentBridge-Transformer-BiEncoder v3.0", fontweight="bold", pad=12)
+    plt.title("Quá trình Hội tụ End-to-End Fine-Tuning TalentBridge-Transformer-BiEncoder v3.0", fontweight="bold", pad=12)
     fig.tight_layout()
     fig.savefig(figures_dir / "training_curves.png")
     plt.close(fig)
 
-    # 2. Benchmark Comparison Bar Chart (MAE & Macro F1)
     b1 = metrics_payload["baselines"]["keyword_jaccard"]
     b2 = metrics_payload["baselines"]["tfidf_cosine"]
     b3 = metrics_payload["baselines"]["zeroshot_transformer"]
@@ -159,7 +194,11 @@ def save_publication_plots(
     rects2 = ax.bar(x + width / 2, maes, width, label="Sai số MAE (Điểm) ↓", color="#f43f5e")
 
     ax.set_ylabel("Giá trị Đo lường (% / Điểm)", fontweight="bold")
-    ax.set_title("So sánh Thực nghiệm 4 Phương pháp trên Tập Test Độc lập (n = 225)", fontweight="bold", pad=12)
+    ax.set_title(
+        f"So sánh Thực nghiệm 4 Phương pháp trên Tập Test Độc lập (n = {metrics_payload['dataset']['test_pairs']:,})",
+        fontweight="bold",
+        pad=12,
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(methods, fontweight="bold")
     ax.legend()
@@ -178,9 +217,8 @@ def save_publication_plots(
     fig.savefig(figures_dir / "benchmark_comparison.png")
     plt.close(fig)
 
-    # 3. Scatter Plot: Ground Truth vs Predicted Score
     fig, ax = plt.subplots(figsize=(6.8, 6.2), dpi=220)
-    ax.scatter(y_true, y_pred_proposed, alpha=0.65, c="#059669", edgecolors="#064e3b", s=42, label="Mẫu kiểm thử (Test Pairs)")
+    ax.scatter(y_true, y_pred_proposed, alpha=0.45, c="#059669", edgecolors="#064e3b", s=32, label="Mẫu kiểm thử (Test Pairs)")
     ax.plot([10, 100], [10, 100], "r--", linewidth=2, label="Đường lý tưởng (y = x)")
     ax.set_xlim(10, 100)
     ax.set_ylim(10, 100)
@@ -198,10 +236,7 @@ def save_publication_plots(
     plt.close(fig)
 
 
-def write_research_report(
-    report_path: Path,
-    metrics_summary: Dict,
-) -> None:
+def write_research_report(report_path: Path, metrics_summary: Dict) -> None:
     ds = metrics_summary["dataset"]
     b1 = metrics_summary["baselines"]["keyword_jaccard"]
     b2 = metrics_summary["baselines"]["tfidf_cosine"]
@@ -209,69 +244,108 @@ def write_research_report(
     proposed = metrics_summary["proposed_model"]
 
     md = f"""# BÁO CÁO NGHIÊN CỨU & THỰC NGHIỆM MÔ HÌNH AI (TIỂU LUẬN CHUYÊN NGÀNH)
-**Đề tài:** Nghiên cứu và Fine-tune mô hình học sâu **Pre-trained Multilingual Transformer Bi-Encoder & Cross-Interaction Neural Network** đánh giá mức độ phù hợp ngữ nghĩa giữa Hồ sơ ứng viên (CV) và Bản mô tả công việc (JD).
+**Đề tài:** Nghiên cứu và Fine-tune End-to-End mô hình học sâu **Pre-trained Multilingual Transformer Bi-Encoder & Cross-Interaction Neural Network** đánh giá mức độ phù hợp ngữ nghĩa giữa Hồ sơ ứng viên (CV) và Bản mô tả công việc (JD).
 
 ---
 
 ## 1. Kiến trúc Mô hình Đề xuất (`TalentBridge-Transformer-BiEncoder v3.0`)
 
-Mô hình được xây dựng trên nền tảng **PyTorch** và thư viện **HuggingFace `transformers`**, kết hợp sức mạnh ngữ nghĩa sâu của mô hình ngôn ngữ tiền huấn luyện đa ngữ (**118 triệu tham số**) với mạng tương tác chéo đa nhiệm:
+Mô hình được xây dựng và huấn luyện End-to-End trên GPU bằng **PyTorch** và **HuggingFace `transformers`**, sử dụng kiến trúc **Dual-Tower Siamese Transformer kết hợp Cross-Interaction Multi-Task Head**:
 
-1. **Tầng Backbone Pre-trained Multilingual Transformer (`118M Parameters`, 12 Encoder Layers):**
-   - Sử dụng mô hình [`{metrics_summary["transformer_backbone"]}`](https://huggingface.co/{metrics_summary["transformer_backbone"]}) gồm 12 tầng Self-Attention đa đầu ($d_{{\\text{{model}}}} = 384$), đã được tiền huấn luyện trên hơn 50 ngôn ngữ (bao gồm tiếng Việt và tiếng Anh).
-   - Áp dụng **Attention-Mask Mean Pooling** lên chuỗi token ẩn $H = [h_1, h_2, \\dots, h_L]$ kết hợp biểu diễn Subword N-Gram SVD ($\\mathbb{{R}}^{{128}}$) tạo thành vector ngữ nghĩa giàu ngữ cảnh $e \\in \\mathbb{{R}}^{{512}}$:
-     $$e_{{\\text{{Transformer}}}} = \\frac{{\\sum_{{t=1}}^L m_t h_t}}{{\\max(\\sum_{{t=1}}^L m_t, 10^{{-9}})}}, \\quad e = [e_{{\\text{{Transformer}}}} \\,\\|\\, e_{{\\text{{Subword-SVD}}}}] \\in \\mathbb{{R}}^{{512}}$$
+1. **Tầng Backbone Pre-trained Multilingual Transformer (`118.4M Parameters`, 12 Attention Layers):**
+   - Sử dụng mô hình [`{metrics_summary["transformer_backbone"]}`](https://huggingface.co/{metrics_summary["transformer_backbone"]}) gồm 12 khối Multi-Head Self-Attention ($d_{{\\text{{model}}}} = 384$).
+   - **Chiến lược Mở khóa Tầng Chọn lọc (Selective Layer Unfreezing & Differential Learning Rate):** Mở khóa trực tiếp **6 tầng Transformer Encoder trên cùng (`Layer 6..11`) + Pooler** (`{metrics_summary["trainable_parameters"]:,}` tham số huấn luyện trực tiếp bằng lan truyền ngược qua cơ chế Self-Attention với `lr = 2e-5`), kết hợp với đầu tương tác chéo (`lr = 3e-4`) và Mixed Precision (`FP16`).
 2. **Tháp Chiếu Kép Có Kết Nối Tắt (Dual-Tower Residual Projection):**
-   - Hai nhánh mạng nơ-ron có khối `ResidualSemanticBlock` ($\\text{{Linear}} \\to \\text{{LayerNorm}} \\to \\text{{GELU}} \\to \\text{{Dropout}}$) chiếu vector CV và JD vào không gian ẩn chuẩn hóa $L_2$ chiều $d = 128$:
+   - Ánh xạ biểu diễn ngữ cảnh Mean-Pooled $e_{{CV}}, e_{{JD}} \\in \\mathbb{{R}}^{{384}}$ qua khối `ResidualSemanticBlock` vào không gian ẩn chuẩn hóa $L_2$ chiều $d = 128$:
      $$u = \\frac{{P_{{CV}}(e_{{CV}})}}{{\\|P_{{CV}}(e_{{CV}})\\|_2}}, \\quad v = \\frac{{P_{{JD}}(e_{{JD}})}}{{\\|P_{{JD}}(e_{{JD}})\\|_2}} \\in \\mathbb{{R}}^{{128}}$$
 3. **Tầng Tương tác Chéo & Đặc trưng Cấu trúc ATS (Cross-Interaction Fusion Head):**
-   - Kết hợp vector hiệu tuyệt đối $|u - v|$, tích Hadamard $u \\odot v$, độ tương đồng Cosine gốc của Transformer $\\cos(e_{{CV}}, e_{{JD}})$, độ tương đồng không gian ẩn $\\cos(u, v)$ và 6 đặc trưng cấu trúc ATS $s \\in \\mathbb{{R}}^6$:
-     $$z = [u \\,\\|\\, v \\,\\|\\, |u - v| \\,\\|\\, (u \\odot v) \\,\\|\\, \\cos(e_{{CV}}, e_{{JD}}) \\,\\|\\, \\cos(u, v) \\,\\|\\, s] \\in \\mathbb{{R}}^{{520}}$$
-4. **Hàm Mất mát Đa nhiệm (Multi-Task Learning Objective):**
-   - Huấn luyện đồng thời 4 đầu ra (`Overall Match`, `Skill Match`, `Experience Match`, `Keyword Match`) cùng ràng buộc căn chỉnh Cosine bằng thuật toán tối ưu `AdamW` và lịch giảm tốc độ học `CosineAnnealingLR`.
+   - Kết hợp $[u \\,\\|\\, v \\,\\|\\, |u - v| \\,\\|\\, (u \\odot v) \\,\\|\\, \\cos(e_{{CV}}, e_{{JD}}) \\,\\|\\, \\cos(u, v) \\,\\|\\, s_{{\\text{{ATS}}}}] \\in \\mathbb{{R}}^{{520}}$ để dự đoán đa nhiệm 4 đầu ra (`Overall Match`, `Skill Match`, `Experience Match`, `Keyword Match`).
 
 ---
 
-## 2. Bộ Dữ liệu Thực nghiệm Thực tế (`1,500` cặp CV–JD)
+## 2. Bộ Dữ liệu Thực nghiệm Quy mô Lớn (`{ds["total_pairs"]:,}` cặp CV–JD)
 
-Bộ dữ liệu thực nghiệm kết hợp dữ liệu tuyển dụng thực tế của con người từ **HuggingFace Hub** và dữ liệu tiếng Việt chuyên ngành:
-- **900 cặp `(Resume, JD)` thực tế từ HuggingFace** ([`cnamuangtoun/resume-job-description-fit`](https://huggingface.co/datasets/cnamuangtoun/resume-job-description-fit)) gồm hồ sơ ứng viên thật và JD thật được gán nhãn 3 mức độ (`Good Fit`, `Potential Fit`, `No Fit`).
-- **600 cặp `(CV, JD)` tiếng Việt & song ngữ** thuộc 8 lĩnh vực CNTT & Kinh doanh, có bổ sung biến thể từ đồng nghĩa/viết tắt (`K8s` $\\leftrightarrow$ `Kubernetes`, `ReactJS` $\\leftrightarrow$ `React 18`, `TS` $\\leftrightarrow$ `TypeScript`, v.v.) và các mẫu *Hard Negatives* (trái ngành hoặc thiếu năm kinh nghiệm).
-- **Phân chia tập dữ liệu (Stratified Split):**
-  - **Train Set (70%):** `{ds["train_pairs"]}` cặp
-  - **Validation Set (15%):** `{ds["val_pairs"]}` cặp
-  - **Test Set Độc lập (15%):** `{ds["test_pairs"]}` cặp
+- **`{ds["huggingface_real_pairs"]:,}` cặp `(Resume, JD)` thực tế của con người từ HuggingFace** ([`cnamuangtoun/resume-job-description-fit`](https://huggingface.co/datasets/cnamuangtoun/resume-job-description-fit) — toàn bộ tập `train.csv` và `test.csv`).
+- **`{ds["vietnamese_bilingual_pairs"]:,}` cặp `(CV, JD)` tiếng Việt & song ngữ** thuộc 8 lĩnh vực CNTT & Kinh doanh (có biến thể từ đồng nghĩa, viết tắt chuyên ngành và mẫu *Hard Negatives*).
+- **Phân chia tập dữ liệu (Stratified Split 70% / 15% / 15%):**
+  - **Train Set:** `{ds["train_pairs"]:,}` cặp
+  - **Validation Set:** `{ds["val_pairs"]:,}` cặp
+  - **Test Set Độc lập:** `{ds["test_pairs"]:,}` cặp
 
 ---
 
-## 3. Kết quả Thực nghiệm So sánh 4 Phương pháp trên Tập Test (`n = {ds["test_pairs"]}`)
+## 3. Kết quả Thực nghiệm So sánh 4 Phương pháp trên Tập Test (`n = {ds["test_pairs"]:,}`)
 
 | Phương pháp / Mô hình | Tham số (Params) | MAE $\\downarrow$ (0-100) | RMSE $\\downarrow$ (0-100) | Pearson $r$ $\\uparrow$ | Spearman $\\rho$ $\\uparrow$ | Accuracy (3 lớp) $\\uparrow$ | Macro F1-Score $\\uparrow$ |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Baseline 1:** Đếm từ khóa (Lexical Keyword Overlap) | Rule-based | `{b1["mae"]}` | `{b1["rmse"]}` | `{b1["pearson_r"]}` | `{b1["spearman_rho"]}` | `{b1["accuracy_pct"]}%` | `{b1["macro_f1_pct"]}%` |
 | **Baseline 2:** Vector TF-IDF Cosine Similarity | Unsupervised | `{b2["mae"]}` | `{b2["rmse"]}` | `{b2["pearson_r"]}` | `{b2["spearman_rho"]}` | `{b2["accuracy_pct"]}%` | `{b2["macro_f1_pct"]}%` |
 | **Baseline 3:** Zero-Shot Pre-trained Transformer (`MiniLM-L12`) | `118.1M` (Frozen) | `{b3["mae"]}` | `{b3["rmse"]}` | `{b3["pearson_r"]}` | `{b3["spearman_rho"]}` | `{b3["accuracy_pct"]}%` | `{b3["macro_f1_pct"]}%` |
-| **Proposed:** `TalentBridge-Transformer-BiEncoder v3.0` | **`118.4M` (Fine-tuned Head)** | **`{proposed["mae"]}`** | **`{proposed["rmse"]}`** | **`{proposed["pearson_r"]}`** | **`{proposed["spearman_rho"]}`** | **`{proposed["accuracy_pct"]}%`** | **`{proposed["macro_f1_pct"]}%`** |
+| **Proposed:** `TalentBridge-Transformer-BiEncoder v3.0 (End-to-End Fine-tuned)` | **`118.4M` (`{metrics_summary["trainable_parameters"]:,}` Trainable)** | **`{proposed["mae"]}`** | **`{proposed["rmse"]}`** | **`{proposed["pearson_r"]}`** | **`{proposed["spearman_rho"]}`** | **`{proposed["accuracy_pct"]}%`** | **`{proposed["macro_f1_pct"]}%`** |
 
 ---
 
-## 4. Biểu đồ Thực nghiệm (Dùng cho Báo cáo Tiểu luận / Khóa luận)
+## 4. Biểu đồ Thực nghiệm (300 DPI)
 
-### Hình 1: Quá trình hội tụ hàm mất mát Multi-Task Huber Loss và MAE trên tập Validation
+### Hình 1: Quá trình hội tụ End-to-End Transformer Backpropagation
 ![Training Curves](./reports/figures/training_curves.png)
 
 ### Hình 2: So sánh Macro F1-Score và Sai số MAE giữa 4 phương pháp
 ![Benchmark Comparison](./reports/figures/benchmark_comparison.png)
 
-### Hình 3: Phân bố điểm dự đoán so với nhãn thực tế trên tập Kiểm thử độc lập (`n = {ds["test_pairs"]}`)
+### Hình 3: Phân bố điểm dự đoán so với nhãn thực tế trên tập Kiểm thử độc lập (`n = {ds["test_pairs"]:,}`)
 ![Prediction Scatter](./reports/figures/prediction_scatter.png)
 """
     report_path.write_text(md, encoding="utf-8")
 
 
+@torch.no_grad()
+def evaluate_loader(model: EndToEndTransformerBiEncoder, loader: DataLoader, device: str) -> np.ndarray:
+    model.eval()
+    preds = []
+    use_amp = device == "cuda"
+    for batch in loader:
+        cv_ids = batch["cv_input_ids"].to(device)
+        cv_mask = batch["cv_attention_mask"].to(device)
+        jd_ids = batch["jd_input_ids"].to(device)
+        jd_mask = batch["jd_attention_mask"].to(device)
+        st = batch["struct"].to(device)
+        with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
+            out = model(cv_ids, cv_mask, jd_ids, jd_mask, st)
+        preds.append(out["overall"].detach().cpu().numpy() * 100.0)
+    return np.concatenate(preds, axis=0)
+
+
+@torch.no_grad()
+def evaluate_zeroshot_cosine(backbone_name: str, loader: DataLoader, device: str) -> np.ndarray:
+    base_model = AutoModel.from_pretrained(backbone_name).to(device)
+    base_model.eval()
+    cos_list = []
+    use_amp = device == "cuda"
+    for batch in loader:
+        cv_ids = batch["cv_input_ids"].to(device)
+        cv_mask = batch["cv_attention_mask"].to(device)
+        jd_ids = batch["jd_input_ids"].to(device)
+        jd_mask = batch["jd_attention_mask"].to(device)
+        with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
+            cv_out = base_model(input_ids=cv_ids, attention_mask=cv_mask)
+            jd_out = base_model(input_ids=jd_ids, attention_mask=jd_mask)
+            u = F.normalize(mean_pooling(cv_out.last_hidden_state, cv_mask), p=2, dim=-1)
+            v = F.normalize(mean_pooling(jd_out.last_hidden_state, jd_mask), p=2, dim=-1)
+            cos = torch.sum(u * v, dim=-1)
+        cos_list.append(cos.detach().cpu().numpy())
+    raw_cos = np.concatenate(cos_list, axis=0)
+    return np.clip(raw_cos * 85.0 + 10.0, 12.0, 96.0)
+
+
 def main() -> None:
     torch.manual_seed(42)
     np.random.seed(42)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"======================================================================")
+    print(f"🚀 DEVICE: {device.upper()} " + (f"({torch.cuda.get_device_name(0)})" if device == "cuda" else "(CPU)"))
+    print(f"======================================================================")
 
     base_dir = Path(__file__).parent
     dataset_path = base_dir / "dataset" / "cv_jd_vietnamese_dataset.json"
@@ -280,16 +354,20 @@ def main() -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    if not dataset_path.exists():
-        build_complete_dataset(dataset_path, real_count=900, vi_count=600)
+    # Ensure full ~10,000-pair dataset is built
+    need_rebuild = not dataset_path.exists()
+    if not need_rebuild:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            dataset = json.load(f)
+        if len(dataset) < 5000:
+            need_rebuild = True
 
-    with open(dataset_path, "r", encoding="utf-8") as f:
-        dataset = json.load(f)
+    if need_rebuild:
+        print("[1/6] Building Full-Scale (~10,000 pairs) HuggingFace Real + Vietnamese Bilingual Dataset...")
+        dataset = build_complete_dataset(dataset_path, real_count=8000, vi_count=2000)
+    else:
+        print(f"[1/6] Loaded existing large-scale dataset: {len(dataset):,} CV-JD pairs.")
 
-    if len(dataset) < 1000:
-        dataset = build_complete_dataset(dataset_path, real_count=900, vi_count=600)
-
-    print(f"[1/6] Loaded {len(dataset)} Real HuggingFace + Vietnamese Bilingual CV-JD pairs.")
     labels = [score_to_label(float(item["ground_truth_score"])) for item in dataset]
     for item, lbl in zip(dataset, labels):
         item["tier_label"] = lbl
@@ -301,152 +379,149 @@ def main() -> None:
     val_data, test_data = train_test_split(
         temp_data, test_size=0.50, random_state=42, stratify=temp_labels
     )
-    print(f"      Stratified Split -> Train: {len(train_data)} | Val: {len(val_data)} | Test: {len(test_data)}")
-
-    print(f"[2/6] Loading Pre-trained Multilingual Transformer ({DEFAULT_TRANSFORMER_BACKBONE})...")
-    tf_extractor = TransformerFeatureExtractor(DEFAULT_TRANSFORMER_BACKBONE)
     print(
-        f"      Loaded Transformer Backbone: {tf_extractor.total_params:,} parameters | hidden_size={tf_extractor.hidden_size} | device={tf_extractor.device}"
+        f"      Stratified Split -> Train: {len(train_data):,} | Val: {len(val_data):,} | Test: {len(test_data):,}"
     )
 
-    print("[3/6] Fitting Subword N-Gram SVD Encoder & Extracting Contextual Transformer Embeddings...")
-    subword_encoder = build_subword_encoder(embedding_dim=128)
-    train_corpus = [x["cv_text"] for x in train_data] + [x["jd_text"] for x in train_data]
-    subword_encoder.fit(train_corpus)
-    svd_dim = subword_encoder.named_steps["svd"].components_.shape[0]
+    print(f"[2/6] Initializing EndToEndTransformerBiEncoder ({DEFAULT_TRANSFORMER_BACKBONE})...")
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_TRANSFORMER_BACKBONE)
+    model = EndToEndTransformerBiEncoder(
+        backbone_name=DEFAULT_TRANSFORMER_BACKBONE,
+        latent_dim=128,
+        struct_dim=6,
+        unfreeze_layers=6,
+    ).to(device)
 
-    def encode_split(split_name: str, items: List[Dict]) -> Tuple[torch.Tensor, ...]:
-        t0 = time.perf_counter()
-        cv_texts = [x["cv_text"] for x in items]
-        jd_texts = [x["jd_text"] for x in items]
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"      Total Model Parameters:     {total_params:,}")
+    print(f"      Trainable Parameters (E2E): {trainable_params:,} (Top 6 Transformer Attention Layers + Dual-Tower Fusion Head)")
 
-        cv_tf = tf_extractor.encode_texts(cv_texts, batch_size=64, max_length=160)
-        jd_tf = tf_extractor.encode_texts(jd_texts, batch_size=64, max_length=160)
+    max_len = 256 if device == "cuda" else 128
+    batch_size = 32 if device == "cuda" else 16
+    collate_fn = make_collate_fn(tokenizer, max_length=max_len)
 
-        cv_svd = subword_encoder.transform(cv_texts).astype(np.float32)
-        jd_svd = subword_encoder.transform(jd_texts).astype(np.float32)
+    train_loader = DataLoader(CvJdPairDataset(train_data), batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(CvJdPairDataset(val_data), batch_size=batch_size * 2, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(CvJdPairDataset(test_data), batch_size=batch_size * 2, shuffle=False, collate_fn=collate_fn)
 
-        cv_joint = np.hstack([cv_tf, cv_svd]).astype(np.float32)
-        jd_joint = np.hstack([jd_tf, jd_svd]).astype(np.float32)
+    # Differential Learning Rates: 2e-5 for Transformer layers, 3e-4 for Dual-Tower Head
+    backbone_params = [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad]
+    head_params = [p for n, p in model.named_parameters() if "head" in n and p.requires_grad]
 
-        struct_vecs = np.stack(
-            [
-                extract_struct_features(
-                    x["cv_text"],
-                    x["jd_text"],
-                    x.get("cv_skills", []),
-                    x.get("jd_required_skills", []),
-                    x.get("jd_optional_skills", []),
-                    float(x.get("cv_years", 1)),
-                    float(x.get("jd_required_years", 1)),
-                )
-                for x in items
-            ]
-        ).astype(np.float32)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": 2e-5, "weight_decay": 0.01},
+            {"params": head_params, "lr": 3e-4, "weight_decay": 0.01},
+        ]
+    )
 
-        y_overall = np.array([x["ground_truth_score"] / 100.0 for x in items], dtype=np.float32)
-        y_skill = np.array([x["skill_score"] / 100.0 for x in items], dtype=np.float32)
-        y_exp = np.array([x["exp_score"] / 100.0 for x in items], dtype=np.float32)
-        y_kw = np.array([x["keyword_score"] / 100.0 for x in items], dtype=np.float32)
-
-        elapsed = time.perf_counter() - t0
-        print(f"      Encoded {split_name} ({len(items)} pairs) through 12-layer Transformer in {elapsed:.1f}s")
-        return (
-            torch.from_numpy(cv_joint),
-            torch.from_numpy(jd_joint),
-            torch.from_numpy(struct_vecs),
-            torch.from_numpy(y_overall),
-            torch.from_numpy(y_skill),
-            torch.from_numpy(y_exp),
-            torch.from_numpy(y_kw),
-            torch.from_numpy(cv_tf),
-            torch.from_numpy(jd_tf),
-        )
-
-    train_tensors = encode_split("Train", train_data)
-    val_tensors = encode_split("Val", val_data)
-    test_tensors = encode_split("Test", test_data)
-
-    joint_dim = tf_extractor.hidden_size + svd_dim
-    print(f"[4/6] Training CvJdBiEncoderHead (joint_dim={joint_dim}, latent_dim=128)...")
-    head_model = CvJdBiEncoderHead(embed_dim=joint_dim, latent_dim=128, struct_dim=6)
-    head_params = sum(p.numel() for p in head_model.parameters())
-    total_system_params = tf_extractor.total_params + head_params
-    print(f"      Total Architecture Parameters: {total_system_params:,} ({tf_extractor.total_params:,} Transformer + {head_params:,} Dual-Tower Fusion Head)")
-
-    optimizer = torch.optim.AdamW(head_model.parameters(), lr=2.5e-3, weight_decay=2e-4)
-    epochs = 120
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
+    epochs = 6 if device == "cuda" else 2
+    total_steps = len(train_loader) * epochs
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[2e-5, 3e-4],
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy="cos",
+    )
     huber = nn.HuberLoss(delta=0.08)
+    use_amp = device == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    cv_tr, jd_tr, st_tr, yo_tr, ys_tr, ye_tr, yk_tr, _, _ = train_tensors
-    cv_va, jd_va, st_va, yo_va, ys_va, ye_va, yk_va, _, _ = val_tensors
-
+    print(
+        f"[3/6] Starting End-to-End Transformer Backpropagation ({epochs} epochs x {len(train_loader)} batches = {total_steps:,} gradient steps)..."
+    )
     best_val_mae = 999.0
-    best_state = None
+    best_head_state = None
     history = []
-    batch_size = 32
-    num_samples = cv_tr.size(0)
+    y_val_true = np.array([float(x["ground_truth_score"]) for x in val_data], dtype=np.float32)
 
+    train_start_t = time.perf_counter()
     for epoch in range(1, epochs + 1):
-        head_model.train()
-        perm = torch.randperm(num_samples)
+        model.train()
         epoch_loss = 0.0
+        n_seen = 0
+        ep_t0 = time.perf_counter()
 
-        for start in range(0, num_samples, batch_size):
-            idx = perm[start : start + batch_size]
+        for step, batch in enumerate(train_loader, start=1):
+            cv_ids = batch["cv_input_ids"].to(device)
+            cv_mask = batch["cv_attention_mask"].to(device)
+            jd_ids = batch["jd_input_ids"].to(device)
+            jd_mask = batch["jd_attention_mask"].to(device)
+            st = batch["struct"].to(device)
+            yo = batch["y_overall"].to(device)
+            ys = batch["y_skill"].to(device)
+            ye = batch["y_exp"].to(device)
+            yk = batch["y_kw"].to(device)
+
             optimizer.zero_grad()
-            out = head_model(cv_tr[idx], jd_tr[idx], st_tr[idx])
+            with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
+                out = model(cv_ids, cv_mask, jd_ids, jd_mask, st)
+                loss_overall = huber(out["overall"], yo)
+                loss_skill = huber(out["skill"], ys)
+                loss_exp = huber(out["experience"], ye)
+                loss_kw = huber(out["keyword"], yk)
+                cos_target = yo * 2.0 - 0.5
+                loss_cos = huber(out["cosine_similarity"], cos_target)
+                loss = (
+                    0.45 * loss_overall
+                    + 0.25 * loss_skill
+                    + 0.15 * loss_exp
+                    + 0.10 * loss_kw
+                    + 0.05 * loss_cos
+                )
 
-            loss_overall = huber(out["overall"], yo_tr[idx])
-            loss_skill = huber(out["skill"], ys_tr[idx])
-            loss_exp = huber(out["experience"], ye_tr[idx])
-            loss_kw = huber(out["keyword"], yk_tr[idx])
-            cos_target = yo_tr[idx] * 2.0 - 0.5
-            loss_cos = huber(out["cosine_similarity"], cos_target)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
-            loss = (
-                0.45 * loss_overall
-                + 0.25 * loss_skill
-                + 0.15 * loss_exp
-                + 0.10 * loss_kw
-                + 0.05 * loss_cos
-            )
-            loss.backward()
-            optimizer.step()
-            epoch_loss += float(loss.item()) * len(idx)
+            bs = cv_ids.size(0)
+            epoch_loss += float(loss.item()) * bs
+            n_seen += bs
 
-        scheduler.step()
+            if step % 50 == 0 or step == len(train_loader):
+                vram_mb = torch.cuda.memory_allocated() / (1024 * 1024) if use_amp else 0.0
+                print(
+                    f"      Epoch {epoch}/{epochs} | Step {step:03d}/{len(train_loader):03d} | Avg Loss: {epoch_loss / n_seen:.5f} | VRAM: {vram_mb:.0f} MB | Elapsed: {time.perf_counter() - ep_t0:.1f}s"
+                )
 
-        head_model.eval()
-        with torch.no_grad():
-            val_out = head_model(cv_va, jd_va, st_va)
-            val_preds = val_out["overall"].numpy() * 100.0
-            val_true = yo_va.numpy() * 100.0
-            val_mae = float(mean_absolute_error(val_true, val_preds))
+        val_preds = evaluate_loader(model, val_loader, device)
+        val_mae = float(mean_absolute_error(y_val_true, val_preds))
 
         if val_mae < best_val_mae:
             best_val_mae = val_mae
-            best_state = {k: v.cpu().clone() for k, v in head_model.state_dict().items()}
+            best_head_state = {k: v.cpu().clone() for k, v in model.head.state_dict().items()}
+            # Also save fine-tuned Transformer backbone weights
+            ft_dir = models_dir / "transformer_backbone_finetuned"
+            model.backbone.save_pretrained(ft_dir)
+            tokenizer.save_pretrained(ft_dir)
 
-        if epoch % 15 == 0 or epoch == 1 or epoch == epochs:
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": round(epoch_loss / num_samples, 5),
-                    "val_mae": round(val_mae, 2),
-                }
-            )
-            print(
-                f"      Epoch {epoch:03d}/{epochs} | Train Loss: {epoch_loss / num_samples:.5f} | Val MAE: {val_mae:.2f} (Best: {best_val_mae:.2f})"
-            )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": round(epoch_loss / n_seen, 5),
+                "val_mae": round(val_mae, 2),
+            }
+        )
+        print(
+            f"  ==> End of Epoch {epoch}/{epochs} | Train Loss: {epoch_loss / n_seen:.5f} | Val MAE: {val_mae:.2f} (Best: {best_val_mae:.2f})"
+        )
 
-    if best_state is not None:
-        head_model.load_state_dict(best_state)
+    total_train_sec = time.perf_counter() - train_start_t
+    print(f"      Finished End-to-End Fine-Tuning in {total_train_sec:.1f}s!")
 
-    print("[5/6] Benchmarking 4 Methods on Held-out Test Set (n=225)...")
-    cv_te, jd_te, st_te, yo_te, ys_te, ye_te, yk_te, cv_tf_te, jd_tf_te = test_tensors
-    y_test_true = yo_te.numpy() * 100.0
+    if best_head_state is not None:
+        model.head.load_state_dict(best_head_state)
+        ft_dir = models_dir / "transformer_backbone_finetuned"
+        if ft_dir.exists():
+            model.backbone = AutoModel.from_pretrained(ft_dir).to(device)
+
+    print(f"[4/6] Evaluating 4 Methods on Held-out Test Set (n={len(test_data):,})...")
+    y_test_true = np.array([float(x["ground_truth_score"]) for x in test_data], dtype=np.float32)
     test_labels = [x["tier_label"] for x in test_data]
 
     # Baseline 1: Lexical Keyword Overlap
@@ -462,6 +537,7 @@ def main() -> None:
 
     # Baseline 2: Unsupervised TF-IDF Cosine
     t0 = time.perf_counter()
+    train_corpus = [x["cv_text"] for x in train_data] + [x["jd_text"] for x in train_data]
     raw_tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=5000, lowercase=True)
     raw_tfidf.fit(train_corpus)
     cv_vec_tf = raw_tfidf.transform([x["cv_text"] for x in test_data]).toarray()
@@ -473,54 +549,49 @@ def main() -> None:
     b2_lat = ((time.perf_counter() - t0) * 1000.0) / len(test_data)
     b2_metrics = evaluate_predictions(y_test_true, b2_preds, test_labels, b2_lat)
 
-    # Baseline 3: Zero-Shot Pre-trained Multilingual Transformer (Cosine Similarity without Fine-tuning)
+    # Baseline 3: Zero-Shot Pre-trained Multilingual Transformer (Frozen)
     t0 = time.perf_counter()
-    raw_tf_cos = torch.sum(cv_tf_te * jd_tf_te, dim=-1).numpy()
-    b3_preds = np.clip(raw_tf_cos * 85.0 + 10.0, 12.0, 96.0)
-    b3_lat = 18.40
+    b3_preds = evaluate_zeroshot_cosine(DEFAULT_TRANSFORMER_BACKBONE, test_loader, device)
+    b3_lat = ((time.perf_counter() - t0) * 1000.0) / len(test_data)
     b3_metrics = evaluate_predictions(y_test_true, b3_preds, test_labels, b3_lat)
 
-    # Proposed Model: Fine-tuned TalentBridge-Transformer-BiEncoder v3.0
-    head_model.eval()
+    # Proposed Model: End-to-End Fine-tuned TalentBridge-Transformer-BiEncoder v3.0
     t0 = time.perf_counter()
-    with torch.no_grad():
-        test_out = head_model(cv_te, jd_te, st_te)
-        prop_preds = test_out["overall"].numpy() * 100.0
-    prop_lat = 19.25
+    prop_preds = evaluate_loader(model, test_loader, device)
+    prop_lat = ((time.perf_counter() - t0) * 1000.0) / len(test_data)
     prop_metrics = evaluate_predictions(y_test_true, prop_preds, test_labels, prop_lat)
 
     print("      ======================================================================")
     print(f"      Baseline 1 (Keyword Overlap)       -> MAE: {b1_metrics['mae']:5.2f} | Macro F1: {b1_metrics['macro_f1_pct']:5.2f}% | Spearman: {b1_metrics['spearman_rho']:.4f}")
     print(f"      Baseline 2 (TF-IDF Cosine)         -> MAE: {b2_metrics['mae']:5.2f} | Macro F1: {b2_metrics['macro_f1_pct']:5.2f}% | Spearman: {b2_metrics['spearman_rho']:.4f}")
     print(f"      Baseline 3 (Zero-Shot Transformer) -> MAE: {b3_metrics['mae']:5.2f} | Macro F1: {b3_metrics['macro_f1_pct']:5.2f}% | Spearman: {b3_metrics['spearman_rho']:.4f}")
-    print(f"      Proposed (Fine-tuned Transformer)  -> MAE: {prop_metrics['mae']:5.2f} | Macro F1: {prop_metrics['macro_f1_pct']:5.2f}% | Spearman: {prop_metrics['spearman_rho']:.4f}")
+    print(f"      Proposed (E2E Fine-tuned Transf.)  -> MAE: {prop_metrics['mae']:5.2f} | Macro F1: {prop_metrics['macro_f1_pct']:5.2f}% | Spearman: {prop_metrics['spearman_rho']:.4f}")
     print("      ======================================================================")
 
-    print("[6/6] Saving Transformer Head Checkpoints, Plots & Research Report...")
-    joblib.dump(subword_encoder, models_dir / "tfidf_svd.joblib")
+    print("[5/6] Saving Checkpoints, Plots & Research Report...")
     torch.save(
         {
             "model_name": "TalentBridge-Transformer-BiEncoder",
-            "model_version": "3.0.0-transformer",
+            "model_version": "3.0.0-e2e-transformer",
             "transformer_backbone": DEFAULT_TRANSFORMER_BACKBONE,
-            "transformer_params": tf_extractor.total_params,
-            "head_params": head_params,
-            "total_params": total_system_params,
-            "embed_dim": joint_dim,
-            "svd_dim": svd_dim,
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "embed_dim": int(model.backbone.config.hidden_size),
             "latent_dim": 128,
             "struct_dim": 6,
-            "state_dict": head_model.state_dict(),
+            "state_dict": model.head.state_dict(),
             "test_metrics": prop_metrics,
         },
         models_dir / "cv_jd_transformer_biencoder.pt",
     )
 
     metrics_payload = {
-        "model_name": "TalentBridge-Transformer-BiEncoder (Multilingual MiniLM-L12 + Dual-Tower Fusion)",
-        "model_version": "3.0.0-transformer",
+        "model_name": "TalentBridge-Transformer-BiEncoder (End-to-End Fine-tuned MiniLM-L12 + Dual-Tower Fusion)",
+        "model_version": "3.0.0-e2e-transformer",
         "transformer_backbone": DEFAULT_TRANSFORMER_BACKBONE,
-        "total_parameters": total_system_params,
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+        "training_time_seconds": round(total_train_sec, 1),
         "framework": f"PyTorch {torch.__version__} + HuggingFace Transformers",
         "dataset": {
             "total_pairs": len(dataset),
@@ -544,8 +615,7 @@ def main() -> None:
 
     save_publication_plots(figures_dir, history, metrics_payload, y_test_true, prop_preds)
     write_research_report(base_dir / "RESEARCH_REPORT_TIEU_LUAN.md", metrics_payload)
-    print(f"      Saved Transformer checkpoint -> {models_dir / 'cv_jd_transformer_biencoder.pt'}")
-    print(f"      Saved 3 Evaluation Charts    -> {figures_dir}")
+    print(f"[6/6] Done! Saved E2E checkpoint -> {models_dir / 'cv_jd_transformer_biencoder.pt'}")
 
 
 if __name__ == "__main__":
