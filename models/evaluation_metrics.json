@@ -1,0 +1,83 @@
+{
+  "model_name": "TalentBridge-BiEncoder (PyTorch Dual-Tower Neural Network)",
+  "model_version": "2.1.0-pytorch",
+  "framework": "PyTorch 2.9.1+cpu",
+  "dataset": {
+    "total_pairs": 360,
+    "train_pairs": 252,
+    "val_pairs": 54,
+    "test_pairs": 54,
+    "domains": 8
+  },
+  "baselines": {
+    "keyword_jaccard": {
+      "mae": 16.88,
+      "rmse": 20.28,
+      "pearson_r": 0.8478,
+      "spearman_rho": 0.6113,
+      "accuracy_pct": 53.7,
+      "macro_f1_pct": 53.44,
+      "latency_ms_per_pair": 0.096
+    },
+    "tfidf_cosine": {
+      "mae": 14.03,
+      "rmse": 16.86,
+      "pearson_r": 0.8396,
+      "spearman_rho": 0.5747,
+      "accuracy_pct": 57.41,
+      "macro_f1_pct": 60.57,
+      "latency_ms_per_pair": 4.45
+    }
+  },
+  "proposed_model": {
+    "mae": 4.73,
+    "rmse": 5.97,
+    "pearson_r": 0.9611,
+    "spearman_rho": 0.9165,
+    "accuracy_pct": 90.74,
+    "macro_f1_pct": 92.42,
+    "latency_ms_per_pair": 0.061
+  },
+  "training_history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.01301,
+      "val_mae": 9.57
+    },
+    {
+      "epoch": 20,
+      "train_loss": 0.00116,
+      "val_mae": 5.24
+    },
+    {
+      "epoch": 40,
+      "train_loss": 0.00071,
+      "val_mae": 5.34
+    },
+    {
+      "epoch": 60,
+      "train_loss": 0.00058,
+      "val_mae": 5.48
+    },
+    {
+      "epoch": 80,
+      "train_loss": 0.0005,
+      "val_mae": 5.5
+    },
+    {
+      "epoch": 100,
+      "train_loss": 0.00048,
+      "val_mae": 5.75
+    },
+    {
+      "epoch": 120,
+      "train_loss": 0.00046,
+      "val_mae": 5.79
+    },
+    {
+      "epoch": 140,
+      "train_loss": 0.00046,
+      "val_mae": 5.76
+    }
+  ]
+}
