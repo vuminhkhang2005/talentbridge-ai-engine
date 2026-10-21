@@ -1,6 +1,7 @@
 """
-FastAPI Microservice for TalentBridge-BiEncoder (PyTorch) Inference
-Serves real-time CV <-> JD semantic matching for the Spring Boot backend on port 8000.
+FastAPI Microservice for TalentBridge-Transformer-BiEncoder v3.0 (118M Parameters)
+Serves real-time CV <-> JD semantic matching using HuggingFace Pre-trained Multilingual Transformer
+(`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`) + Dual-Tower Cross-Interaction Head.
 """
 
 import json
@@ -16,14 +17,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from model_arch import CvJdBiEncoderNet, extract_struct_features
+from transformer_model import (
+    CvJdBiEncoderHead,
+    DEFAULT_TRANSFORMER_BACKBONE,
+    TransformerFeatureExtractor,
+)
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
 
 app = FastAPI(
-    title="TalentBridge AI Engine (PyTorch Bi-Encoder)",
-    description="Dual-Tower Siamese Neural Network + Cross-Interaction Fusion for Vietnamese CV-JD Matching",
-    version="2.1.0-pytorch",
+    title="TalentBridge AI Engine (Pre-trained Multilingual Transformer Bi-Encoder)",
+    description="118M-Parameter Multilingual Transformer + Dual-Tower Cross-Interaction Neural Network for CV-JD Matching",
+    version="3.0.0-transformer",
 )
 
 app.add_middleware(
@@ -33,28 +39,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global model state loaded on startup
-_text_encoder = None
-_pytorch_model: Optional[CvJdBiEncoderNet] = None
+_subword_encoder = None
+_tf_extractor: Optional[TransformerFeatureExtractor] = None
+_transformer_head: Optional[CvJdBiEncoderHead] = None
+_legacy_model: Optional[CvJdBiEncoderNet] = None
 _model_meta = {
-    "model_name": "TalentBridge-BiEncoder",
-    "model_version": "2.1.0-pytorch",
+    "model_name": "TalentBridge-Transformer-BiEncoder",
+    "model_version": "3.0.0-transformer",
+    "backbone": DEFAULT_TRANSFORMER_BACKBONE,
+    "total_params": 118_000_000,
 }
 _metrics_cache = {}
 
 
 def load_artifacts() -> None:
-    global _text_encoder, _pytorch_model, _model_meta, _metrics_cache
+    global _subword_encoder, _tf_extractor, _transformer_head, _legacy_model, _model_meta, _metrics_cache
     vec_path = MODELS_DIR / "tfidf_svd.joblib"
-    pt_path = MODELS_DIR / "cv_jd_biencoder.pt"
+    tf_pt_path = MODELS_DIR / "cv_jd_transformer_biencoder.pt"
+    legacy_pt_path = MODELS_DIR / "cv_jd_biencoder.pt"
     metrics_path = MODELS_DIR / "evaluation_metrics.json"
 
-    if vec_path.exists() and pt_path.exists():
-        _text_encoder = joblib.load(vec_path)
-        ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
-        _model_meta["model_name"] = ckpt.get("model_name", "TalentBridge-BiEncoder")
-        _model_meta["model_version"] = ckpt.get("model_version", "2.1.0-pytorch")
+    if vec_path.exists():
+        _subword_encoder = joblib.load(vec_path)
 
+    if tf_pt_path.exists():
+        ckpt = torch.load(tf_pt_path, map_location="cpu", weights_only=False)
+        backbone_name = ckpt.get("transformer_backbone", DEFAULT_TRANSFORMER_BACKBONE)
+        if _tf_extractor is None or _tf_extractor.model_name != backbone_name:
+            _tf_extractor = TransformerFeatureExtractor(backbone_name)
+
+        head = CvJdBiEncoderHead(
+            embed_dim=int(ckpt.get("embed_dim", 512)),
+            latent_dim=int(ckpt.get("latent_dim", 128)),
+            struct_dim=int(ckpt.get("struct_dim", 6)),
+        )
+        head.load_state_dict(ckpt["state_dict"])
+        head.eval()
+        _transformer_head = head
+
+        _model_meta["model_name"] = ckpt.get("model_name", "TalentBridge-Transformer-BiEncoder")
+        _model_meta["model_version"] = ckpt.get("model_version", "3.0.0-transformer")
+        _model_meta["backbone"] = backbone_name
+        _model_meta["total_params"] = int(ckpt.get("total_params", _tf_extractor.total_params))
+    elif legacy_pt_path.exists():
+        ckpt = torch.load(legacy_pt_path, map_location="cpu", weights_only=False)
         net = CvJdBiEncoderNet(
             text_embed_dim=int(ckpt.get("text_embed_dim", 96)),
             latent_dim=int(ckpt.get("latent_dim", 64)),
@@ -62,7 +90,7 @@ def load_artifacts() -> None:
         )
         net.load_state_dict(ckpt["state_dict"])
         net.eval()
-        _pytorch_model = net
+        _legacy_model = net
 
     if metrics_path.exists():
         with open(metrics_path, "r", encoding="utf-8") as f:
@@ -97,13 +125,16 @@ class CvJdPredictResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-    if _pytorch_model is None:
+    if _transformer_head is None and _legacy_model is None:
         load_artifacts()
     return {
         "status": "UP",
-        "model_loaded": _pytorch_model is not None,
+        "model_loaded": (_transformer_head is not None) or (_legacy_model is not None),
+        "transformer_active": _transformer_head is not None,
         "model_name": _model_meta["model_name"],
         "model_version": _model_meta["model_version"],
+        "backbone": _model_meta["backbone"],
+        "total_parameters": _model_meta["total_params"],
         "pytorch_version": torch.__version__,
     }
 
@@ -117,13 +148,11 @@ def get_evaluation_metrics():
 
 @app.post("/api/v1/ai-engine/predict", response_model=CvJdPredictResponse)
 def predict_match(req: CvJdPredictRequest):
-    if _pytorch_model is None or _text_encoder is None:
+    if _transformer_head is None and _legacy_model is None:
         load_artifacts()
 
     t0 = time.perf_counter()
 
-    cv_vec = _text_encoder.transform([req.cv_text]).astype(np.float32)
-    jd_vec = _text_encoder.transform([req.jd_text]).astype(np.float32)
     struct_vec = extract_struct_features(
         req.cv_text,
         req.jd_text,
@@ -134,21 +163,43 @@ def predict_match(req: CvJdPredictRequest):
         req.jd_required_years,
     ).reshape(1, -1)
 
-    with torch.no_grad():
-        x_cv = torch.from_numpy(cv_vec)
-        x_jd = torch.from_numpy(jd_vec)
-        x_st = torch.from_numpy(struct_vec)
-        out = _pytorch_model(x_cv, x_jd, x_st)
+    if _transformer_head is not None and _tf_extractor is not None and _subword_encoder is not None:
+        cv_tf = _tf_extractor.encode_texts([req.cv_text], batch_size=1, max_length=160)
+        jd_tf = _tf_extractor.encode_texts([req.jd_text], batch_size=1, max_length=160)
+        cv_svd = _subword_encoder.transform([req.cv_text]).astype(np.float32)
+        jd_svd = _subword_encoder.transform([req.jd_text]).astype(np.float32)
 
-        overall_raw = float(out["overall"].item()) * 100.0
-        skill_raw = float(out["skill"].item()) * 100.0
-        exp_raw = float(out["experience"].item()) * 100.0
-        kw_raw = float(out["keyword"].item()) * 100.0
-        cos_sim = float(out["cosine_similarity"].item())
+        cv_joint = np.hstack([cv_tf, cv_svd]).astype(np.float32)
+        jd_joint = np.hstack([jd_tf, jd_svd]).astype(np.float32)
+
+        with torch.no_grad():
+            out = _transformer_head(
+                torch.from_numpy(cv_joint),
+                torch.from_numpy(jd_joint),
+                torch.from_numpy(struct_vec),
+            )
+            overall_raw = float(out["overall"].item()) * 100.0
+            skill_raw = float(out["skill"].item()) * 100.0
+            exp_raw = float(out["experience"].item()) * 100.0
+            kw_raw = float(out["keyword"].item()) * 100.0
+            cos_sim = float(out["cosine_similarity"].item())
+    else:
+        cv_vec = _subword_encoder.transform([req.cv_text]).astype(np.float32)
+        jd_vec = _subword_encoder.transform([req.jd_text]).astype(np.float32)
+        with torch.no_grad():
+            out = _legacy_model(
+                torch.from_numpy(cv_vec),
+                torch.from_numpy(jd_vec),
+                torch.from_numpy(struct_vec),
+            )
+            overall_raw = float(out["overall"].item()) * 100.0
+            skill_raw = float(out["skill"].item()) * 100.0
+            exp_raw = float(out["experience"].item()) * 100.0
+            kw_raw = float(out["keyword"].item()) * 100.0
+            cos_sim = float(out["cosine_similarity"].item())
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Clamp to realistic ATS bounds [10..98]
     overall_score = int(round(min(98.0, max(10.0, overall_raw))))
     skill_score = int(round(min(98.0, max(10.0, skill_raw))))
     exp_score = int(round(min(98.0, max(10.0, exp_raw))))
