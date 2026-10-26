@@ -22,6 +22,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _skill_in_cv(skill: str, cv_set: set, cv_lower: str) -> bool:
+    if skill in cv_set:
+        return True
+    pattern = r"(?<![a-z0-9])" + re.escape(skill) + r"(?![a-z0-9])"
+    return bool(re.search(pattern, cv_lower))
+
+
 def extract_struct_features(
     cv_text: str,
     jd_text: str,
@@ -45,8 +52,8 @@ def extract_struct_features(
     req_set = {s.strip().lower() for s in jd_req_skills if s.strip()}
     opt_set = {s.strip().lower() for s in jd_opt_skills if s.strip()}
 
-    matched_req = sum(1 for s in req_set if s in cv_set or s in cv_lower)
-    matched_opt = sum(1 for s in opt_set if s in cv_set or s in cv_lower)
+    matched_req = sum(1 for s in req_set if _skill_in_cv(s, cv_set, cv_lower))
+    matched_opt = sum(1 for s in opt_set if _skill_in_cv(s, cv_set, cv_lower))
 
     req_cov = matched_req / max(1, len(req_set))
     opt_cov = matched_opt / max(1, len(opt_set)) if opt_set else req_cov

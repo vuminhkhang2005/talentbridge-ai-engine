@@ -213,20 +213,58 @@ def predict_match(req: CvJdPredictRequest):
     skill_rich = float(struct_vec[0, 2])    # [0..1] candidate skill richness
     exp_ratio = float(struct_vec[0, 3])     # [0..1] experience fulfillment ratio
 
-    struct_skill_score = min(98.0, max(15.0, req_cov * 86.0 + opt_cov * 8.0 + skill_rich * 8.0))
-    struct_exp_score = 92.0 if req.jd_required_years <= req.cv_years else max(35.0, exp_ratio * 88.0)
+    years_deficit = max(0.0, float(req.jd_required_years) - float(req.cv_years))
+    if years_deficit <= 0.0:
+        exp_depth_factor = 1.0
+        struct_exp_score = min(98.0, 92.0 + min(6.0, (req.cv_years - req.jd_required_years) * 2.0))
+        seniority_cap = 98.0
+    elif req.cv_years <= 0.0:
+        # Intern / Fresher (0 commercial years) applying to Junior / Middle / Senior JDs
+        if req.jd_required_years <= 1.5:
+            # Junior (1-3 years required)
+            exp_depth_factor = 0.72
+            struct_exp_score = 46.0
+            seniority_cap = 68.0
+        elif req.jd_required_years <= 3.0:
+            # Middle (2-4 years required)
+            exp_depth_factor = 0.56
+            struct_exp_score = 30.0
+            seniority_cap = 54.0
+        else:
+            # Senior / Lead (4+ years required)
+            exp_depth_factor = 0.42
+            struct_exp_score = 18.0
+            seniority_cap = 40.0
+    else:
+        # Experienced candidate with partial experience deficit
+        if years_deficit <= 1.0:
+            exp_depth_factor = 0.84
+            struct_exp_score = 62.0
+            seniority_cap = 75.0
+        elif years_deficit <= 2.0:
+            exp_depth_factor = 0.68
+            struct_exp_score = 44.0
+            seniority_cap = 62.0
+        else:
+            exp_depth_factor = 0.52
+            struct_exp_score = 28.0
+            seniority_cap = 48.0
+
+    raw_struct_skill = min(98.0, max(15.0, req_cov * 86.0 + opt_cov * 8.0 + skill_rich * 8.0))
+    struct_skill_score = raw_struct_skill * exp_depth_factor
     # Cross-lingual semantic alignment bonus when cosine >= 0.45
     sem_alignment = min(96.0, max(20.0, (max(0.0, cos_sim) / 0.72) * 85.0))
-    struct_kw_score = 0.60 * struct_skill_score + 0.40 * sem_alignment
+    struct_kw_score = (0.65 * raw_struct_skill + 0.35 * sem_alignment) * (0.50 + 0.50 * exp_depth_factor)
 
-    # Fuse neural head predictions with structural & cross-lingual signals
-    skill_calibrated = 0.35 * skill_raw + 0.65 * struct_skill_score
-    exp_calibrated = 0.30 * exp_raw + 0.70 * struct_exp_score
-    kw_calibrated = 0.40 * kw_raw + 0.60 * struct_kw_score
+    # Fuse neural head predictions with structural & seniority-calibrated signals
+    skill_calibrated = (0.25 * (skill_raw * exp_depth_factor) + 0.75 * struct_skill_score)
+    exp_calibrated = (0.15 * (exp_raw * exp_depth_factor) + 0.85 * struct_exp_score) if years_deficit > 0 else (0.30 * exp_raw + 0.70 * struct_exp_score)
+    kw_calibrated = 0.30 * (kw_raw * exp_depth_factor) + 0.70 * struct_kw_score
     overall_calibrated = (
-        0.30 * overall_raw
-        + 0.70 * (0.55 * skill_calibrated + 0.25 * exp_calibrated + 0.20 * kw_calibrated)
+        0.20 * (overall_raw * exp_depth_factor)
+        + 0.80 * (0.50 * skill_calibrated + 0.30 * exp_calibrated + 0.20 * kw_calibrated)
     )
+    overall_calibrated = min(seniority_cap, overall_calibrated)
 
     overall_score = int(round(min(98.0, max(12.0, overall_calibrated))))
     skill_score = int(round(min(98.0, max(12.0, skill_calibrated))))
