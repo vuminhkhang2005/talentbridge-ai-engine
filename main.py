@@ -66,7 +66,15 @@ def load_artifacts() -> None:
 
     if tf_pt_path.exists():
         ckpt = torch.load(tf_pt_path, map_location="cpu", weights_only=False)
-        backbone_source = str(ft_backbone_dir) if ft_backbone_dir.exists() else ckpt.get("transformer_backbone", DEFAULT_TRANSFORMER_BACKBONE)
+        has_local_weights = (
+            (ft_backbone_dir / "model.safetensors").exists()
+            or (ft_backbone_dir / "pytorch_model.bin").exists()
+        )
+        backbone_source = (
+            str(ft_backbone_dir)
+            if has_local_weights
+            else ckpt.get("transformer_backbone", DEFAULT_TRANSFORMER_BACKBONE)
+        )
         if _tf_extractor is None or _tf_extractor.model_name != backbone_source:
             _tf_extractor = TransformerFeatureExtractor(backbone_source)
 
